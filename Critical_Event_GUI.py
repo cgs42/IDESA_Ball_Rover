@@ -1,62 +1,97 @@
-#this file is the user interface thread to control the critical event robot
-# by Caitlin Grainger-Spivey
-
-#first we import the necessary libraries
 import tkinter as tk
 import math
+import threading
+import queue
+import time
+import paho.mqtt.client as mqtt
 
+#MQTT broker details
+BROKER = "fesv-mqtt.bath.ac.uk"
+PORT = 31415
+USERNAME = "student"
+PASSWORD = "HousekeepingGlintsStreetwise"
+
+TOPIC_SPEED = "CottonCandyGrapes/CriticalEventRobot/Speed"
+TOPIC_DIRECTION = "CottonCandyGrapes/CriticalEventRobot/Direction"
+
+def on_connect(client, userdata, flags, rc):
+    print("Connected with result code", rc)
+
+def mqtt_thread(q: queue.Queue):
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.username_pw_set(USERNAME, password=PASSWORD)
+    client.connect(BROKER, PORT, 60)
+    client.loop_start()
+
+    try:
+        while True:
+            try:
+                direction, speed = q.get(timeout=0.5)
+                # Publish speed as a number
+                client.publish(TOPIC_SPEED, speed)
+                # Publish direction as a string
+                client.publish(TOPIC_DIRECTION, direction)
+                print(f"Published: {direction}, {speed}")
+            except queue.Empty:
+                pass
+    except KeyboardInterrupt:
+        client.loop_stop()
+        client.disconnect()
+
+# Joystick UI (pushes to queue) ---
 class JoystickUI:
-    def __init__(self, root):
+    def __init__(self, root, q):
         self.root = root
+        self.q = q
         self.root.title("D-Pad")
-
         self.is_on = False
+
         self.toggle_btn = tk.Button(root, text="OFF", width=10, command=self.toggle)
         self.toggle_btn.pack(pady=10)
 
-        # Canvas for joystick
         self.canvas_size = 200
-        self.radius = 90
+        self.radius = 80
         self.canvas = tk.Canvas(root, width=self.canvas_size, height=self.canvas_size, bg="lightgrey")
         self.canvas.pack()
 
-        # Draw joystick boundary
-        self.center = self.canvas_size // 2
-        self.canvas.create_oval(self.center - self.radius, self.center - self.radius,
-                    self.center + self.radius, self.center + self.radius,
-                    outline="black")
-
-        # Draw directional arrows (up, down, left, right) inside the boundary
-        arrow_dist = int(self.radius * 0.65)   # distance from center to arrow tip
-        arrow_size = 12                        # half-width/height of arrow base
+        # draw simple arrow triangles inside the D-pad circle
+        c = self.canvas_size // 2
+        arrow_h = 20
+        arrow_w = 12
+        margin = 15
 
         # Up arrow (triangle pointing up)
-        up_tip = (self.center, self.center - arrow_dist)
-        up_left = (self.center - arrow_size, self.center - arrow_dist + arrow_size)
-        up_right = (self.center + arrow_size, self.center - arrow_dist + arrow_size)
-        self.canvas.create_polygon(up_tip, up_left, up_right, fill="black", outline="black")
+        tip_y_up = c - self.radius + margin
+        base_y_up = tip_y_up + arrow_h
+        up_points = (c, tip_y_up, c - arrow_w, base_y_up, c + arrow_w, base_y_up)
+        self.canvas.create_polygon(up_points, fill="black", outline="")
 
         # Down arrow (triangle pointing down)
-        down_tip = (self.center, self.center + arrow_dist)
-        down_left = (self.center - arrow_size, self.center + arrow_dist - arrow_size)
-        down_right = (self.center + arrow_size, self.center + arrow_dist - arrow_size)
-        self.canvas.create_polygon(down_tip, down_left, down_right, fill="black", outline="black")
+        tip_y_down = c + self.radius - margin
+        base_y_down = tip_y_down - arrow_h
+        down_points = (c, tip_y_down, c + arrow_w, base_y_down, c - arrow_w, base_y_down)
+        self.canvas.create_polygon(down_points, fill="black", outline="")
 
         # Left arrow (triangle pointing left)
-        left_tip = (self.center - arrow_dist, self.center)
-        left_top = (self.center - arrow_dist + arrow_size, self.center - arrow_size)
-        left_bottom = (self.center - arrow_dist + arrow_size, self.center + arrow_size)
-        self.canvas.create_polygon(left_tip, left_top, left_bottom, fill="black", outline="black")
+        tip_x_left = c - self.radius + margin
+        base_x_left = tip_x_left + arrow_h
+        left_points = (tip_x_left, c, base_x_left, c - arrow_w, base_x_left, c + arrow_w)
+        self.canvas.create_polygon(left_points, fill="black", outline="")
 
         # Right arrow (triangle pointing right)
-        right_tip = (self.center + arrow_dist, self.center)
-        right_top = (self.center + arrow_dist - arrow_size, self.center - arrow_size)
-        right_bottom = (self.center + arrow_dist - arrow_size, self.center + arrow_size)
-        self.canvas.create_polygon(right_tip, right_top, right_bottom, fill="black", outline="black")
+        tip_x_right = c + self.radius - margin
+        base_x_right = tip_x_right - arrow_h
+        right_points = (tip_x_right, c, base_x_right, c + arrow_w, base_x_right, c - arrow_w)
+        self.canvas.create_polygon(right_points, fill="black", outline="")
 
-        # Bind mouse events
-        self.canvas.bind("<B1-Motion>", self.move)   # drag
-        self.canvas.bind("<ButtonRelease-1>", self.release)  # release
+        self.center = self.canvas_size // 2
+        self.canvas.create_oval(self.center - self.radius, self.center - self.radius,
+                                self.center + self.radius, self.center + self.radius,
+                                outline="black")
+
+        self.canvas.bind("<B1-Motion>", self.move)
+        self.canvas.bind("<ButtonRelease-1>", self.release)
 
     def toggle(self):
         self.is_on = not self.is_on
@@ -65,29 +100,19 @@ class JoystickUI:
     def move(self, event):
         if not self.is_on:
             return
-
-        # Vector from center
         dx = event.x - self.center
         dy = event.y - self.center
-
-        # Distance and angle
         distance = math.sqrt(dx**2 + dy**2)
-        angle = math.degrees(math.atan2(-dy, dx))  # atan2(y,x), invert y for screen coords
-
-        # Normalize speed (0–100%)
-        speed = min(distance / self.radius, 1.0) * 100
-
-        # Direction string
+        angle = math.degrees(math.atan2(-dy, dx))
+        speed = min(distance / self.radius, 1.0) *100
         direction = self.get_direction(angle)
-
-        print(f"Direction: {direction}, Speed: {speed:.1f}%")
+        self.q.put((direction, round(speed, 1)))
 
     def release(self, event):
         if self.is_on:
-            print("Joystick released: CENTER, Speed: 0%")
+            self.q.put(("CENTER", 0))
 
     def get_direction(self, angle):
-        # Map angle to direction (8-way)
         if -22.5 <= angle < 22.5:
             return "RIGHT"
         elif 22.5 <= angle < 67.5:
@@ -108,6 +133,9 @@ class JoystickUI:
             return "CENTER"
 
 if __name__ == "__main__":
+    q = queue.Queue()
+    t = threading.Thread(target=mqtt_thread, args=(q,), daemon=True)
+    t.start()
     root = tk.Tk()
-    app = JoystickUI(root)
+    app = JoystickUI(root, q)
     root.mainloop()
