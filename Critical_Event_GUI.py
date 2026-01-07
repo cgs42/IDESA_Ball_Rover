@@ -1,3 +1,5 @@
+# Threaded user interface and MQTT comms to control the critical event robot with a D-pad. Output can be found in the subtopic CottonCandyGrapes/CriticalEventRobot
+
 import tkinter as tk
 import math
 import threading
@@ -10,9 +12,9 @@ BROKER = "fesv-mqtt.bath.ac.uk"
 PORT = 31415
 USERNAME = "student"
 PASSWORD = "HousekeepingGlintsStreetwise"
-
 TOPIC_SPEED = "CottonCandyGrapes/CriticalEventRobot/Speed"
 TOPIC_DIRECTION = "CottonCandyGrapes/CriticalEventRobot/Direction"
+
 
 def on_connect(client, userdata, flags, rc):
     print("Connected with result code", rc)
