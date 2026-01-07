@@ -1,87 +1,237 @@
-# This script is an entry point to the Aruco marker detection and pose estimation.
-# It uses the camera calibration values to estimate the pose of the markers.
-# The script will display the original image and the image with the detected markers and their pose.
-# It is using the OpenCV library 4.10+ which has the latest Aruco functions
-
+import tkinter as tk
+from PIL import Image, ImageTk
 import cv2
 import cv2.aruco as aruco
 import numpy as np
-import time # We will use this to ensure a steady processing rate
+import time
+import math
+import queue
 
-
-# Load the camera calibration values
+# --------------------
+# Camera / ArUco Setup
+# --------------------
 camera_calibration = np.load('Sample_Calibration.npz')
-CM=camera_calibration['CM'] #camera matrix
-dist_coef=camera_calibration['dist_coef']# distortion coefficients from the camera
+CM = camera_calibration['CM']
+dist_coef = camera_calibration['dist_coef']
 
-# Define the ArUco dictionary and parameters
 marker_size = 40
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 parameters = aruco.DetectorParameters()
 
-# Define a processing rate
-processing_period = 0.25
-
-# Create two OpenCV named windows
-cv2.namedWindow("Frame", cv2.WINDOW_AUTOSIZE)
-cv2.namedWindow("Gray", cv2.WINDOW_AUTOSIZE)
-
-# Position the windows next to each other
-cv2.moveWindow("Gray", 640, 100)
-cv2.moveWindow("Frame", 0, 100)
-# Start capturing video
 cap = cv2.VideoCapture(0)
 
-# Set the starting time
-start_time = time.time()
-fps = 0
+# --------------------
+# Tkinter Window
+# --------------------
+root = tk.Tk()
+root.title("IDESA Ball Rover UI")
+root.geometry("1000x600")
+root.configure(bg="black")
 
-while True:
-    # Capture frame-by-frame
+left_frame = tk.Frame(root, bg="black")
+right_frame = tk.Frame(root, bg="black")
+
+left_frame.pack(side="left", fill="both", expand=True)
+right_frame.pack(side="right", fill="both", expand=True)
+
+# --------------------
+# LEFT SIDE
+# --------------------
+tk.Button(
+    left_frame,
+    text="Find Minerals",
+    bg="#222",
+    fg="white",
+    font=("Arial", 14)
+).pack(pady=10)
+
+camera_label = tk.Label(left_frame, bg="black")
+camera_label.pack(pady=10)
+
+# --------------------
+# RIGHT SIDE
+# --------------------
+tk.Label(
+    right_frame,
+    text="Manual Override",
+    bg="black",
+    fg="white",
+    font=("Arial", 16)
+).pack(pady=20)
+
+manual_override = False
+
+# --------------------
+# Joystick UI
+# --------------------
+class JoystickUI:
+    def __init__(self, parent, q):
+        self.q = q
+        self.is_on = False
+
+        self.canvas_size = 200
+        self.radius = 80
+
+        self.canvas = tk.Canvas(
+            parent,
+            width=self.canvas_size,
+            height=self.canvas_size,
+            bg="lightgrey",
+            highlightthickness=0
+        )
+        self.canvas.pack(pady=10)
+
+        c = self.canvas_size // 2
+        arrow_h = 20
+        arrow_w = 12
+        margin = 15
+
+        # Arrows
+        self.canvas.create_polygon(
+            (c, c - self.radius + margin,
+             c - arrow_w, c - self.radius + margin + arrow_h,
+             c + arrow_w, c - self.radius + margin + arrow_h),
+            fill="black"
+        )
+        self.canvas.create_polygon(
+            (c, c + self.radius - margin,
+             c + arrow_w, c + self.radius - margin - arrow_h,
+             c - arrow_w, c + self.radius - margin - arrow_h),
+            fill="black"
+        )
+        self.canvas.create_polygon(
+            (c - self.radius + margin, c,
+             c - self.radius + margin + arrow_h, c - arrow_w,
+             c - self.radius + margin + arrow_h, c + arrow_w),
+            fill="black"
+        )
+        self.canvas.create_polygon(
+            (c + self.radius - margin, c,
+             c + self.radius - margin - arrow_h, c + arrow_w,
+             c + self.radius - margin - arrow_h, c - arrow_w),
+            fill="black"
+        )
+
+        self.center = c
+        self.canvas.create_oval(
+            c - self.radius, c - self.radius,
+            c + self.radius, c + self.radius,
+            outline="black"
+        )
+
+        self.canvas.bind("<B1-Motion>", self.move)
+        self.canvas.bind("<ButtonRelease-1>", self.release)
+
+    def set_enabled(self, enabled):
+        self.is_on = enabled
+        print(f"[JOYSTICK] {'ENABLED' if enabled else 'DISABLED'}")
+
+    def move(self, event):
+        if not self.is_on:
+            return
+
+        dx = event.x - self.center
+        dy = event.y - self.center
+        distance = math.sqrt(dx**2 + dy**2)
+        angle = math.degrees(math.atan2(-dy, dx))
+        speed = min(distance / self.radius, 1.0) * 100
+
+        direction = self.get_direction(angle)
+        speed = round(speed, 1)
+
+        # OUTPUT TO TERMINAL
+        print(f"JOYSTICK → DIRECTION={direction} | SPEED={speed}")
+
+        self.q.put((direction, speed))
+
+    def release(self, event):
+        if self.is_on:
+            print("JOYSTICK → CENTER | SPEED=0")
+            self.q.put(("CENTER", 0))
+
+    def get_direction(self, angle):
+        if -22.5 <= angle < 22.5:
+            return "RIGHT"
+        elif 22.5 <= angle < 67.5:
+            return "UP-RIGHT"
+        elif 67.5 <= angle < 112.5:
+            return "UP"
+        elif 112.5 <= angle < 157.5:
+            return "UP-LEFT"
+        elif angle >= 157.5 or angle < -157.5:
+            return "LEFT"
+        elif -157.5 <= angle < -112.5:
+            return "DOWN-LEFT"
+        elif -112.5 <= angle < -67.5:
+            return "DOWN"
+        elif -67.5 <= angle < -22.5:
+            return "DOWN-RIGHT"
+        else:
+            return "CENTER"
+
+control_queue = queue.Queue()
+joystick = JoystickUI(right_frame, control_queue)
+
+def toggle_manual():
+    global manual_override
+    manual_override = not manual_override
+    toggle_button.config(text="ON" if manual_override else "OFF")
+    joystick.set_enabled(manual_override)
+
+toggle_button = tk.Button(
+    right_frame,
+    text="OFF",
+    bg="#222",
+    fg="white",
+    font=("Arial", 14),
+    command=toggle_manual
+)
+toggle_button.pack(pady=10)
+
+# --------------------
+# Camera Update Loop
+# --------------------
+def update_camera():
     ret, frame = cap.read()
     if not ret:
-        print("Can't receive frame (stream end?). Exiting ...")
-        break
+        root.after(30, update_camera)
+        return
 
-    # Convert frame to grayscale
+    h, w, _ = frame.shape
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    cv2.imshow('gray-image', gray)
 
-    # Detect markers
-    corners, ids, rejectedImgPoints = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
-
-    # If markers are detected
+    corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
     if ids is not None:
-        # Draw detected markers
         frame = aruco.drawDetectedMarkers(frame, corners, ids)
-
-        # Estimate pose of each marker
-        rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, marker_size, CM, dist_coef)
-
+        rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
+            corners, marker_size, CM, dist_coef
+        )
         for rvec, tvec in zip(rvecs, tvecs):
-            # Draw axis for each marker
             frame = cv2.drawFrameAxes(frame, CM, dist_coef, rvec, tvec, 100)
 
-    # Add the frame rate to the image
-    cv2.putText(frame, f"CAMERA FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    cv2.putText(frame, f"PROCESSING FPS: {1/processing_period:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    # Grid overlay
+    for i in range(1, 7):
+        cv2.line(frame, (int(w*i/7), 0), (int(w*i/7), h), (200,200,200), 1)
+    for i in range(1, 5):
+        cv2.line(frame, (0, int(h*i/5)), (w, int(h*i/5)), (200,200,200), 1)
 
-    # Display the resulting frame
-    cv2.imshow('Frame', frame)
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img = Image.fromarray(frame).resize((480, 360))
+    imgtk = ImageTk.PhotoImage(img)
 
-    # Break the loop on 'q' key press
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    camera_label.imgtk = imgtk
+    camera_label.config(image=imgtk)
 
-    # Ensure a steady processing rate
-    elapsed_time = time.time() - start_time
-    fps = 1 / elapsed_time
-    if elapsed_time < processing_period:
-        time.sleep(processing_period - elapsed_time)
-    start_time = time.time()
+    root.after(30, update_camera)
 
+# --------------------
+# Cleanup
+# --------------------
+def on_close():
+    cap.release()
+    root.destroy()
 
+root.protocol("WM_DELETE_WINDOW", on_close)
 
-# When everything is done, release the capture and close windows
-cap.release()
-cv2.destroyAllWindows()
+update_camera()
+root.mainloop()

@@ -15,7 +15,6 @@ PASSWORD = "HousekeepingGlintsStreetwise"
 TOPIC_SPEED = "CottonCandyGrapes/CriticalEventRobot/Speed"
 TOPIC_DIRECTION = "CottonCandyGrapes/CriticalEventRobot/Direction"
 
-
 def on_connect(client, userdata, flags, rc):
     print("Connected with result code", rc)
 
