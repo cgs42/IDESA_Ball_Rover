@@ -29,16 +29,16 @@ camera_calibration = np.load('workdir/Calibration.npz')
 CM = camera_calibration['CM']
 dist_coef = camera_calibration['dist_coef']
 
-marker_size = 40
+marker_size = 67 # aruco codes measure 67mm x 67mm
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 parameters = aruco.DetectorParameters()
 
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(0)
 
 # =========================================================
 # UDP SETUP
 # =========================================================
-UDP_IP = "172.26.198.126"
+UDP_IP = "172.26.156.13"  # amy's IP = "172.26.198.126", Caitlin's IP = "172.26.156.13"
 UDP_PORT = 25000
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -48,12 +48,19 @@ last_udp_time = 0.0
 # =========================================================
 # MINERAL STATE
 # =========================================================
-MINERAL_IDS = [1, 2, 3, 4, 5]
-COLLECTION_RADIUS_PX = 30
-TARGET_PAUSE_SEC = 5.0
-DETECTION_TIME_SEC = 5.0
+MINERAL_IDS = [1, 2, 3, 4, 5]  # aruco code IDs representing minerals
+COLLECTION_RADIUS_PX = 30      # distance from target position to consider mineral 'collected' in pixels
+TARGET_PAUSE_SEC = 5.0         # time to wait at each target before moving to the next in seconds
+DETECTION_TIME_SEC = 5.0       # time allowed for mineral detection phase to accomodate for detection flickering in seconds
+BASE_ID = 6                    # aruco code ID representing home base
+Robot_ID = 0                   # aruco code ID representing the robot
+orange_crisis_ID = 10          # ID 10 (appears as orange in GUI) - A localised weather event is occuring, continue to collect minerals but avoid the event and adapt the path around it. 
+red_crisis_ID = 11             # ID 11 (appears as red in GUI) - A severe weather event is occuring, stop all mineral collection and return to base. 
+green_crisis_ID = 12           # ID 12 (appears as green in GUI) - An indentifiable moving object has been spotted by the satellite, interrupt mineral collection and go and investigate the object.
 
-mineral_map = {}
+
+# set vectors and variables
+mineral_map = {}               # id: (x, y, z) position in mm
 remaining_minerals = []
 path_order = []
 
@@ -66,6 +73,11 @@ target_reached_time = 0.0
 
 detecting_minerals = False
 detection_start_time = 0.0
+
+base_added_to_path = False     # ensures base is added only once
+
+weather_pos = None          # position of the orange crisis event
+
 
 # =========================================================
 # PATH PLANNING
@@ -100,7 +112,7 @@ left_frame.pack(side="left", fill="both", expand=True)
 def toggle_mineral_find():
     global system_active, mineral_map, remaining_minerals, path_order
     global current_target_id, waiting_for_next_target
-    global detecting_minerals, detection_start_time
+    global detecting_minerals, detection_start_time, base_added_to_path
 
     system_active = not system_active
 
@@ -113,6 +125,7 @@ def toggle_mineral_find():
         waiting_for_next_target = False
         detecting_minerals = True
         detection_start_time = time.time()
+        base_added_to_path = False
         button.config(text="End Mineral Find")
     else:
         print("\n[SYSTEM] MINERAL FIND STOPPED")
@@ -147,6 +160,7 @@ def camera_thread():
     global last_udp_time, current_target_id
     global waiting_for_next_target, target_reached_time
     global collected_mineral_id, detecting_minerals
+    global system_active, base_added_to_path
 
     while not stop_event.is_set():
         ret, frame = cap.read()
@@ -165,73 +179,106 @@ def camera_thread():
             )
 
             for i, mid in enumerate(ids.flatten()):
-                c = corners[i][0]
-                cx, cy = np.mean(c[:, 0]), np.mean(c[:, 1])
+                tvec = tvecs[i][0]  # in mm
+                R, _ = cv2.Rodrigues(rvecs[i])
 
-                if mid == 0:
-                    robot_pos = (cx, cy)
-                    R, _ = cv2.Rodrigues(rvecs[i])
+                # Robot detection
+                if mid == Robot_ID:
+                    robot_pos = tvec
                     robot_yaw = math.degrees(math.atan2(R[1, 0], R[0, 0]))
 
-                if detecting_minerals and mid in MINERAL_IDS:
-                    mineral_map.setdefault(mid, (cx, cy))
+                # Base detection (always active)
+                if mid == BASE_ID:
+                    mineral_map[BASE_ID] = tvec
 
-                frame = cv2.drawFrameAxes(
-                    frame, CM, dist_coef, rvecs[i], tvecs[i], 100
-                )
+                if mid == orange_crisis_ID:
+                    weather_pos = tvec
+
+                    
+                # Mineral detection (only during scan)
+                if detecting_minerals and mid in MINERAL_IDS:
+                    mineral_map.setdefault(mid, tvec)
+
+                frame = cv2.drawFrameAxes(frame, CM, dist_coef, rvecs[i], tvecs[i], 100)
 
             frame = aruco.drawDetectedMarkers(frame, corners, ids)
 
         # Finish detection phase
         if detecting_minerals and time.time() - detection_start_time >= DETECTION_TIME_SEC:
             detecting_minerals = False
-            remaining_minerals[:] = list(mineral_map.keys())
+            remaining_minerals[:] = [mid for mid in mineral_map.keys() if mid in MINERAL_IDS]
+            print("Mineral map", mineral_map)
 
-            if robot_pos:
+            if robot_pos is not None:
                 path_order[:] = compute_shortest_path(
                     robot_pos,
                     [(mid, mineral_map[mid]) for mid in remaining_minerals]
                 )
-                print("[PATH] Optimal order:", path_order)
 
-        # Select target
+                print("[PATH] Initial mineral order:", path_order)
+
+        # Select next target
         if system_active and not detecting_minerals and current_target_id is None and not waiting_for_next_target:
             if path_order:
                 current_target_id = path_order[0]
                 print("[NAV] Target:", current_target_id)
 
-        # Collection
-        if system_active and robot_pos and current_target_id and not waiting_for_next_target:
-            tx, ty = mineral_map[current_target_id]
+        # Collection logic
+        if system_active and robot_pos is not None and current_target_id and not waiting_for_next_target:
+            tx, ty, tz = mineral_map[current_target_id]
             if math.hypot(robot_pos[0] - tx, robot_pos[1] - ty) < COLLECTION_RADIUS_PX:
                 collected_mineral_id = current_target_id
+
+                # If base reached
+                if current_target_id == BASE_ID:
+                    print("\n[SYSTEM] Return to base completed. Mission ended.")
+                    system_active = False
+                    button.config(text="Find Minerals")
+                    current_target_id = None
+                    waiting_for_next_target = False
+                    continue
+
+                # Normal mineral collection
                 if current_target_id in remaining_minerals:
                     remaining_minerals.remove(current_target_id)
                 if path_order and path_order[0] == current_target_id:
                     path_order.pop(0)
+
+                # After last mineral, append base if visible
+                if not path_order and BASE_ID in mineral_map and not base_added_to_path:
+                    print("\n[SYSTEM] All minerals collected. Returning to base.")
+                    path_order.append(BASE_ID)
+                    base_added_to_path = True
+
                 current_target_id = None
                 waiting_for_next_target = True
                 target_reached_time = time.time()
                 print("[COLLECT] Mineral reached")
 
-        # Pause
+        # Pause between targets
         if waiting_for_next_target and time.time() - target_reached_time >= TARGET_PAUSE_SEC:
             waiting_for_next_target = False
             collected_mineral_id = None
 
-        # UDP
-        if system_active and robot_pos and robot_yaw is not None and current_target_id:
+        # UDP sending
+        if system_active and robot_pos is not None and robot_yaw is not None and current_target_id:
             now = time.time()
             if now - last_udp_time >= 1.0 / UDP_RATE_HZ:
-                tx, ty = mineral_map[current_target_id]
-                dx, dy = tx - robot_pos[0], ty - robot_pos[1]
+                tx, ty, tz = mineral_map[current_target_id]
+                rx, ry, rz = robot_pos
+
+                dx = tx - rx
+                dy = ty - ry
+
                 target_angle = math.degrees(math.atan2(dx, -dy))
                 relative_angle = (target_angle - robot_yaw + 180) % 360 - 180
+                relative_distance = math.hypot(dx, dy)
+
                 udp_sock.sendto(
-                    struct.pack('<fff', robot_pos[0], robot_pos[1], relative_angle),
+                    struct.pack('<ff', relative_distance, relative_angle),
                     (UDP_IP, UDP_PORT)
                 )
-                print(f"[UDP] x={robot_pos[0]:.1f} y={robot_pos[1]:.1f} angle={relative_angle:.1f}")
+                print(f"[UDP] distance = {relative_distance:.1f}mm angle = {relative_angle:.1f}°")
                 last_udp_time = now
 
         if not frame_queue.full():
@@ -245,7 +292,7 @@ def update_ui():
         frame, robot_pos = frame_queue.get()
 
         # Draw full path
-        if robot_pos and path_order:
+        if robot_pos is not None and path_order:
             pts = [robot_pos] + [mineral_map[mid] for mid in path_order]
             for i in range(len(pts) - 1):
                 cv2.line(frame,
@@ -280,4 +327,3 @@ root.protocol("WM_DELETE_WINDOW", on_close)
 threading.Thread(target=camera_thread, daemon=True).start()
 update_ui()
 root.mainloop()
-
