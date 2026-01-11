@@ -1,64 +1,3 @@
-import tkinter as tk
-from PIL import Image, ImageTk
-import cv2
-import cv2.aruco as aruco
-import numpy as np
-import time
-import math
-import queue
-import json
-import threading
-import paho.mqtt.client as mqtt
-import socket 
-# =========================================================
-# CAMERA & ARUCO SETUP
-# =========================================================
-camera_calibration = np.load('workdir/Calibration.npz')
-CM = camera_calibration['CM']
-dist_coef = camera_calibration['dist_coef']
-
-marker_size = 40
-aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-parameters = aruco.DetectorParameters()
-
-cap = cv2.VideoCapture(0)
-
-# =========================================================
-# UDP SETUP
-# UDP is used to send lower level messages constantly as it is fast.
-# This includes the constant update of the robots location and its angle
-# =========================================================
-UDP_IP = "172.26.198.126"  # Computer's IP
-UDP_PORT1 = 25000
-UDP_PORT2 = 50001
-MESSAGE = message 
-
-# =========================================================
-# MQTT SETUP
-# The MQTT server will be used to send more top level pieces of information.
-# This includes the desired position of the minerals for the robot to go to,a nd the crisis event type.
-# =========================================================
-BROKER = "fesv-mqtt.bath.ac.uk"
-PORT = 31415
-USERNAME = "student"
-PASSWORD = "HousekeepingGlintsStreetwise"
-
-TOPIC_DESIRED_POSITION = "CottonCandyGrapes/BallRobot/DesiredPosition"
-TOPIC_CURRENT_POSITION = "CottonCandyGrapes/BallRobot/CurrentPosition"
-TOPIC_CURRENT_ANGLE = "CottonCandyGrapes/BallRobot/CurrentAngle"
-
-MQTT_RATE_HZ = 10
-last_mqtt_time = 0.0
-
-mqtt_client = mqtt.Client()
-mqtt_client.username_pw_set(USERNAME, PASSWORD)
-mqtt_client.connect(BROKER, PORT, 60)
-mqtt_client.loop_start()
-
-print("[MQTT] Connected to broker")
-
-# =========================================================
-# TKINTER UI
 # UI is split into two columns. The left column shows the live satellite feed. 
 # When the button 'Find Minerals' is pressed, the robot will 'collect minerals' defined by aruco code IDs 2 to 5. 
 # It does this by creating the most optimal path between identified minerals and drawing it on the GUI.
@@ -70,6 +9,85 @@ print("[MQTT] Connected to broker")
 # ID 10 (appears as orange in GUI) - A localised weather event is occuring, continue to collect minerals but avoid the event and adapt the path around it. 
 # ID 11 (appears as red in GUI) - A severe weather event is occuring, stop all mineral collection and return to base. 
 # ID 12 (appears as green in GUI) - An indentifiable moving object has been spotted by the satellite, interrupt mineral collection and go and investigate the object.
+
+import tkinter as tk
+from PIL import Image, ImageTk
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import time
+import math
+import queue
+import threading
+import socket
+import struct
+
+# =========================================================
+# CAMERA & ARUCO SETUP
+# =========================================================
+camera_calibration = np.load('workdir/Calibration.npz')
+CM = camera_calibration['CM']
+dist_coef = camera_calibration['dist_coef']
+
+marker_size = 40
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()
+
+cap = cv2.VideoCapture(1)
+
+# =========================================================
+# UDP SETUP
+# =========================================================
+UDP_IP = "172.26.198.126"
+UDP_PORT = 25000
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+UDP_RATE_HZ = 1.0
+last_udp_time = 0.0
+
+# =========================================================
+# MINERAL STATE
+# =========================================================
+MINERAL_IDS = [1, 2, 3, 4, 5]
+COLLECTION_RADIUS_PX = 30
+TARGET_PAUSE_SEC = 5.0
+DETECTION_TIME_SEC = 5.0
+
+mineral_map = {}
+remaining_minerals = []
+path_order = []
+
+current_target_id = None
+collected_mineral_id = None
+
+system_active = False
+waiting_for_next_target = False
+target_reached_time = 0.0
+
+detecting_minerals = False
+detection_start_time = 0.0
+
+# =========================================================
+# PATH PLANNING
+# =========================================================
+def compute_shortest_path(start_pos, mineral_items):
+    path = []
+    current = start_pos
+    items = mineral_items.copy()
+
+    while items:
+        mid, pos = min(
+            items,
+            key=lambda x: math.hypot(current[0] - x[1][0], current[1] - x[1][1])
+        )
+        path.append(mid)
+        current = pos
+        items = [i for i in items if i[0] != mid]
+
+    return path
+
+# =========================================================
+# TKINTER UI
 # =========================================================
 root = tk.Tk()
 root.title("IDESA Ball Rover UI")
@@ -77,107 +95,69 @@ root.geometry("1000x600")
 root.configure(bg="black")
 
 left_frame = tk.Frame(root, bg="black")
-right_frame = tk.Frame(root, bg="black")
 left_frame.pack(side="left", fill="both", expand=True)
-right_frame.pack(side="right", fill="both", expand=True)
 
-tk.Button(
-    left_frame, text="Find Minerals", bg="#222", fg="white", font=("Arial", 14)
-).pack(pady=10)
+def toggle_mineral_find():
+    global system_active, mineral_map, remaining_minerals, path_order
+    global current_target_id, waiting_for_next_target
+    global detecting_minerals, detection_start_time
+
+    system_active = not system_active
+
+    if system_active:
+        print("\n[SYSTEM] MINERAL FIND STARTED")
+        mineral_map.clear()
+        remaining_minerals.clear()
+        path_order.clear()
+        current_target_id = None
+        waiting_for_next_target = False
+        detecting_minerals = True
+        detection_start_time = time.time()
+        button.config(text="End Mineral Find")
+    else:
+        print("\n[SYSTEM] MINERAL FIND STOPPED")
+        button.config(text="Find Minerals")
+        current_target_id = None
+        waiting_for_next_target = False
+        detecting_minerals = False
+
+button = tk.Button(
+    left_frame,
+    text="Find Minerals",
+    bg="#222",
+    fg="white",
+    font=("Arial", 14),
+    command=toggle_mineral_find
+)
+button.pack(pady=10)
 
 camera_label = tk.Label(left_frame, bg="black")
-camera_label.pack(pady=10)
-
-tk.Label(
-    right_frame, text="Manual Override",
-    bg="black", fg="white", font=("Arial", 16)
-).pack(pady=20)
-
-manual_override = False
-
-# Joystick on right side for manual override. Can only be used when enabled.
-class JoystickUI:
-    def __init__(self, parent, q):
-        self.q = q
-        self.is_on = False
-        self.canvas_size = 200
-        self.radius = 80
-
-        self.canvas = tk.Canvas(
-            parent, width=200, height=200,
-            bg="lightgrey", highlightthickness=0
-        )
-        self.canvas.pack(pady=10)
-
-        c = 100
-        self.center = c
-        self.canvas.create_oval(c-80, c-80, c+80, c+80, outline="black")
-
-        self.canvas.bind("<B1-Motion>", self.move)
-        self.canvas.bind("<ButtonRelease-1>", self.release)
-
-    def set_enabled(self, enabled):
-        self.is_on = enabled
-        print(f"[JOYSTICK] {'ENABLED' if enabled else 'DISABLED'}")
-
-    def move(self, event):
-        if not self.is_on:
-            return
-        dx = event.x - self.center
-        dy = event.y - self.center
-        dist = math.sqrt(dx**2 + dy**2)
-        angle = math.degrees(math.atan2(-dy, dx))
-        speed = min(dist / self.radius, 1.0) * 100
-        print(f"[JOYSTICK] angle={angle:.1f} speed={speed:.1f}")
-        self.q.put((angle, speed))
-
-    def release(self, event):
-        if self.is_on:
-            print("[JOYSTICK] CENTER speed=0")
-            self.q.put((0, 0))
-
-control_queue = queue.Queue()
-joystick = JoystickUI(right_frame, control_queue)
-
-def toggle_manual():
-    global manual_override
-    manual_override = not manual_override
-    toggle_button.config(text="ON" if manual_override else "OFF")
-    joystick.set_enabled(manual_override)
-
-toggle_button = tk.Button(
-    right_frame, text="OFF", bg="#222", fg="white",
-    font=("Arial", 14), command=toggle_manual
-)
-toggle_button.pack(pady=10)
+camera_label.pack()
 
 # =========================================================
-# THREAD COMMUNICATION
+# THREADING
 # =========================================================
 frame_queue = queue.Queue(maxsize=1)
 stop_event = threading.Event()
 
 # =========================================================
-# CAMERA + MQTT THREAD
+# CAMERA THREAD
 # =========================================================
 def camera_thread():
-    global last_mqtt_time
+    global last_udp_time, current_target_id
+    global waiting_for_next_target, target_reached_time
+    global collected_mineral_id, detecting_minerals
 
     while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
             continue
 
-        h, w, _ = frame.shape
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        corners, ids, _ = aruco.detectMarkers(
-            gray, aruco_dict, parameters=parameters
-        )
+        corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
 
         robot_pos = None
-        robot_angle = None
-        minerals = []
+        robot_yaw = None
 
         if ids is not None:
             rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
@@ -187,17 +167,14 @@ def camera_thread():
             for i, mid in enumerate(ids.flatten()):
                 c = corners[i][0]
                 cx, cy = np.mean(c[:, 0]), np.mean(c[:, 1])
-                x, y = cx / w, cy / h
 
-                if mid == 1:
-                    robot_pos = (float(x), float(y))
+                if mid == 0:
+                    robot_pos = (cx, cy)
                     R, _ = cv2.Rodrigues(rvecs[i])
-                    robot_angle = float(
-                        math.degrees(math.atan2(R[1, 0], R[0, 0]))
-                    )
+                    robot_yaw = math.degrees(math.atan2(R[1, 0], R[0, 0]))
 
-                elif 2 <= mid <= 5:
-                    minerals.append((int(mid), float(x), float(y)))
+                if detecting_minerals and mid in MINERAL_IDS:
+                    mineral_map.setdefault(mid, (cx, cy))
 
                 frame = cv2.drawFrameAxes(
                     frame, CM, dist_coef, rvecs[i], tvecs[i], 100
@@ -205,46 +182,86 @@ def camera_thread():
 
             frame = aruco.drawDetectedMarkers(frame, corners, ids)
 
-        now = time.time()
-        if now - last_mqtt_time >= 1.0 / MQTT_RATE_HZ:
-            last_mqtt_time = now
+        # Finish detection phase
+        if detecting_minerals and time.time() - detection_start_time >= DETECTION_TIME_SEC:
+            detecting_minerals = False
+            remaining_minerals[:] = list(mineral_map.keys())
 
             if robot_pos:
-                payload = {"x": robot_pos[0], "y": robot_pos[1]}
-                print(f"[MQTT] RobotPos → {payload}")
-                mqtt_client.publish(
-                    TOPIC_CURRENT_POSITION, json.dumps(payload)
+                path_order[:] = compute_shortest_path(
+                    robot_pos,
+                    [(mid, mineral_map[mid]) for mid in remaining_minerals]
                 )
+                print("[PATH] Optimal order:", path_order)
 
-            if robot_angle is not None:
-                payload = {"angle": robot_angle}
-                print(f"[MQTT] RobotAngle → {payload}")
-                mqtt_client.publish(
-                    TOPIC_CURRENT_ANGLE, json.dumps(payload)
-                )
+        # Select target
+        if system_active and not detecting_minerals and current_target_id is None and not waiting_for_next_target:
+            if path_order:
+                current_target_id = path_order[0]
+                print("[NAV] Target:", current_target_id)
 
-            if minerals:
-                minerals.sort()
-                mid, mx, my = minerals[0]
-                payload = {"x": mx, "y": my, "id": mid}
-                print(f"[MQTT] Target → {payload}")
-                mqtt_client.publish(
-                    TOPIC_DESIRED_POSITION, json.dumps(payload)
+        # Collection
+        if system_active and robot_pos and current_target_id and not waiting_for_next_target:
+            tx, ty = mineral_map[current_target_id]
+            if math.hypot(robot_pos[0] - tx, robot_pos[1] - ty) < COLLECTION_RADIUS_PX:
+                collected_mineral_id = current_target_id
+                if current_target_id in remaining_minerals:
+                    remaining_minerals.remove(current_target_id)
+                if path_order and path_order[0] == current_target_id:
+                    path_order.pop(0)
+                current_target_id = None
+                waiting_for_next_target = True
+                target_reached_time = time.time()
+                print("[COLLECT] Mineral reached")
+
+        # Pause
+        if waiting_for_next_target and time.time() - target_reached_time >= TARGET_PAUSE_SEC:
+            waiting_for_next_target = False
+            collected_mineral_id = None
+
+        # UDP
+        if system_active and robot_pos and robot_yaw is not None and current_target_id:
+            now = time.time()
+            if now - last_udp_time >= 1.0 / UDP_RATE_HZ:
+                tx, ty = mineral_map[current_target_id]
+                dx, dy = tx - robot_pos[0], ty - robot_pos[1]
+                target_angle = math.degrees(math.atan2(dx, -dy))
+                relative_angle = (target_angle - robot_yaw + 180) % 360 - 180
+                udp_sock.sendto(
+                    struct.pack('<fff', robot_pos[0], robot_pos[1], relative_angle),
+                    (UDP_IP, UDP_PORT)
                 )
+                print(f"[UDP] x={robot_pos[0]:.1f} y={robot_pos[1]:.1f} angle={relative_angle:.1f}")
+                last_udp_time = now
 
         if not frame_queue.full():
-            frame_queue.put(frame)
+            frame_queue.put((frame, robot_pos))
 
 # =========================================================
-# TKINTER UPDATE LOOP
+# UI LOOP
 # =========================================================
 def update_ui():
     if not frame_queue.empty():
-        frame = frame_queue.get()
+        frame, robot_pos = frame_queue.get()
+
+        # Draw full path
+        if robot_pos and path_order:
+            pts = [robot_pos] + [mineral_map[mid] for mid in path_order]
+            for i in range(len(pts) - 1):
+                cv2.line(frame,
+                         (int(pts[i][0]), int(pts[i][1])),
+                         (int(pts[i+1][0]), int(pts[i+1][1])),
+                         (255, 0, 0), 2)
+
+        # Countdown
+        if waiting_for_next_target:
+            remaining = max(0, int(TARGET_PAUSE_SEC - (time.time() - target_reached_time)))
+            cv2.putText(frame, f"Next target in {remaining}s",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                        (0, 255, 255), 2)
+
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = ImageTk.PhotoImage(
-            Image.fromarray(frame).resize((480, 360))
-        )
+        img = ImageTk.PhotoImage(Image.fromarray(frame).resize((480, 360)))
         camera_label.imgtk = img
         camera_label.config(image=img)
 
@@ -254,10 +271,7 @@ def update_ui():
 # CLEANUP
 # =========================================================
 def on_close():
-    print("[SYSTEM] Shutting down...")
     stop_event.set()
-    mqtt_client.loop_stop()
-    mqtt_client.disconnect()
     cap.release()
     root.destroy()
 
@@ -266,3 +280,4 @@ root.protocol("WM_DELETE_WINDOW", on_close)
 threading.Thread(target=camera_thread, daemon=True).start()
 update_ui()
 root.mainloop()
+
