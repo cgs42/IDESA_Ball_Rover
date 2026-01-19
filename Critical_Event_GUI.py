@@ -1,51 +1,49 @@
-# Threaded user interface and MQTT comms to control the critical event robot with a D-pad. Output can be found in the subtopic CottonCandyGrapes/CriticalEventRobot
-
 import tkinter as tk
 import math
 import threading
-import queue
 import time
-import paho.mqtt.client as mqtt
+import socket
+import struct
 
-#MQTT broker details
-BROKER = "fesv-mqtt.bath.ac.uk"
-PORT = 31415
-USERNAME = "student"
-PASSWORD = "HousekeepingGlintsStreetwise"
-TOPIC_SPEED = "CottonCandyGrapes/CriticalEventRobot/Speed"
-TOPIC_DIRECTION = "CottonCandyGrapes/CriticalEventRobot/Direction"
+# =========================================================
+# UDP SETUP
+# =========================================================
+UDP_IP = "138.38.226.46"   # Update as needed
+UDP_PORT = 25000
 
-def on_connect(client, userdata, flags, rc):
-    print("Connected with result code", rc)
+UDP_RATE_HZ = 2.0  # 2 messages per second
 
-def mqtt_thread(q: queue.Queue):
-    client = mqtt.Client()
-    client.on_connect = on_connect
-    client.username_pw_set(USERNAME, password=PASSWORD)
-    client.connect(BROKER, PORT, 60)
-    client.loop_start()
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    try:
-        while True:
-            try:
-                direction, speed = q.get(timeout=0.5)
-                # Publish speed as a number
-                client.publish(TOPIC_SPEED, speed)
-                # Publish direction as a string
-                client.publish(TOPIC_DIRECTION, direction)
-                print(f"Published: {direction}, {speed}")
-            except queue.Empty:
-                pass
-    except KeyboardInterrupt:
-        client.loop_stop()
-        client.disconnect()
+# Shared state
+udp_enabled = False
+left_cmd = 0.0
+right_cmd = 0.0
 
-# Joystick UI (pushes to queue) ---
+
+def udp_thread():
+    global left_cmd, right_cmd, udp_enabled
+
+    interval = 1.0 / UDP_RATE_HZ
+
+    while True:
+        if udp_enabled:
+            # Pack two float32 values into 8 bytes
+            msg = struct.pack("ff", float(left_cmd), float(right_cmd))
+            udp_sock.sendto(msg, (UDP_IP, UDP_PORT))
+            print(f"Sent UDP (binary floats): L={left_cmd:.3f}, R={right_cmd:.3f}")
+
+        time.sleep(interval)
+
+
+# =========================================================
+# JOYSTICK UI
+# =========================================================
 class JoystickUI:
-    def __init__(self, root, q):
+    def __init__(self, root):
         self.root = root
-        self.q = q
-        self.root.title("D-Pad")
+        self.root.title("Differential Drive Joystick")
+
         self.is_on = False
 
         self.toggle_btn = tk.Button(root, text="OFF", width=10, command=self.toggle)
@@ -53,90 +51,132 @@ class JoystickUI:
 
         self.canvas_size = 200
         self.radius = 80
+        self.center = self.canvas_size // 2
+
         self.canvas = tk.Canvas(root, width=self.canvas_size, height=self.canvas_size, bg="lightgrey")
         self.canvas.pack()
 
-        # draw simple arrow triangles inside the D-pad circle
+        #draw arrow triangles inside d-pad circle
         c = self.canvas_size // 2
-        arrow_h = 20
-        arrow_w = 12
+        arrow_height = 20
+        arrow_width = 12
         margin = 15
 
-        # Up arrow (triangle pointing up)
+        # Up arrow
         tip_y_up = c - self.radius + margin
-        base_y_up = tip_y_up + arrow_h
-        up_points = (c, tip_y_up, c - arrow_w, base_y_up, c + arrow_w, base_y_up)
-        self.canvas.create_polygon(up_points, fill="black", outline="")
+        base_y_up = tip_y_up + arrow_height
+        up_points = (c, tip_y_up, c - arrow_width, base_y_up, c + arrow_width, base_y_up)
+        self.canvas.create_polygon(up_points, fill="black", outline = "")
 
-        # Down arrow (triangle pointing down)
+        # Down arrow
         tip_y_down = c + self.radius - margin
-        base_y_down = tip_y_down - arrow_h
-        down_points = (c, tip_y_down, c + arrow_w, base_y_down, c - arrow_w, base_y_down)
-        self.canvas.create_polygon(down_points, fill="black", outline="")
+        base_y_down = tip_y_down - arrow_height
+        down_points = (c, tip_y_down, c - arrow_width, base_y_down, c + arrow_width, base_y_down)
+        self.canvas.create_polygon(down_points, fill="black", outline = "")
 
-        # Left arrow (triangle pointing left)
+        # Left arrow
         tip_x_left = c - self.radius + margin
-        base_x_left = tip_x_left + arrow_h
-        left_points = (tip_x_left, c, base_x_left, c - arrow_w, base_x_left, c + arrow_w)
-        self.canvas.create_polygon(left_points, fill="black", outline="")
+        base_x_left = tip_x_left + arrow_height
+        left_points = (tip_x_left, c, base_x_left, c - arrow_width, base_x_left, c + arrow_width)
+        self.canvas.create_polygon(left_points, fill="black", outline = "")
 
-        # Right arrow (triangle pointing right)
+        # Right arrow   
         tip_x_right = c + self.radius - margin
-        base_x_right = tip_x_right - arrow_h
-        right_points = (tip_x_right, c, base_x_right, c + arrow_w, base_x_right, c - arrow_w)
-        self.canvas.create_polygon(right_points, fill="black", outline="")
+        base_x_right = tip_x_right - arrow_height
+        right_points = (tip_x_right, c, base_x_right, c - arrow_width, base_x_right, c + arrow_width)   
+        self.canvas.create_polygon(right_points, fill="black", outline = "")
+    
 
-        self.center = self.canvas_size // 2
-        self.canvas.create_oval(self.center - self.radius, self.center - self.radius,
-                                self.center + self.radius, self.center + self.radius,
-                                outline="black")
+        self.canvas.create_oval(
+            self.center - self.radius,
+            self.center - self.radius,
+            self.center + self.radius,
+            self.center + self.radius,
+            outline="black"
+        )
 
         self.canvas.bind("<B1-Motion>", self.move)
         self.canvas.bind("<ButtonRelease-1>", self.release)
 
     def toggle(self):
+        global udp_enabled, left_cmd, right_cmd
+
         self.is_on = not self.is_on
         self.toggle_btn.config(text="ON" if self.is_on else "OFF")
 
+        if self.is_on:
+            udp_enabled = True
+        else:
+            # Stop robot and stop UDP
+            left_cmd = 0.0
+            right_cmd = 0.0
+            udp_enabled = False
+
+            # Send one final stop packet
+            msg = struct.pack("ff", 0.0, 0.0)
+            udp_sock.sendto(msg, (UDP_IP, UDP_PORT))
+            print("Sent UDP stop packet (binary floats)")
+
+    def expo(self, x, e):
+        return math.copysign(abs(x) ** e, x)
+
     def move(self, event):
+        global left_cmd, right_cmd
+
         if not self.is_on:
             return
+
         dx = event.x - self.center
         dy = event.y - self.center
+
         distance = math.sqrt(dx**2 + dy**2)
-        angle = math.degrees(math.atan2(-dy, dx))
-        speed = min(distance / self.radius, 1.0) *100
-        direction = self.get_direction(angle)
-        self.q.put((direction, round(speed, 1)))
+        if distance > self.radius:
+            scale = self.radius / distance
+            dx *= scale
+            dy *= scale
+
+        # Normalize joystick
+        forward = -dy / self.radius   # up = positive
+        turn = dx / self.radius       # right = positive
+
+        forward = max(-1.0, min(1.0, forward))
+        turn = max(-1.0, min(1.0, turn))
+
+        # Expo shaping
+        EXPO_FORWARD = 1.5
+        EXPO_TURN = 2.0
+
+        forward = self.expo(forward, EXPO_FORWARD)
+        turn = self.expo(turn, EXPO_TURN)
+
+        # Differential drive mix
+        left = forward + turn
+        right = forward - turn
+
+        # Normalize
+        max_mag = max(abs(left), abs(right), 1.0)
+        left /= max_mag
+        right /= max_mag
+
+        left_cmd = left
+        right_cmd = right
 
     def release(self, event):
+        global left_cmd, right_cmd
+
         if self.is_on:
-            self.q.put(("CENTER", 0))
+            left_cmd = 0.0
+            right_cmd = 0.0
 
-    def get_direction(self, angle):
-        if -22.5 <= angle < 22.5:
-            return "RIGHT"
-        elif 22.5 <= angle < 67.5:
-            return "UP-RIGHT"
-        elif 67.5 <= angle < 112.5:
-            return "UP"
-        elif 112.5 <= angle < 157.5:
-            return "UP-LEFT"
-        elif 157.5 <= angle or angle < -157.5:
-            return "LEFT"
-        elif -157.5 <= angle < -112.5:
-            return "DOWN-LEFT"
-        elif -112.5 <= angle < -67.5:
-            return "DOWN"
-        elif -67.5 <= angle < -22.5:
-            return "DOWN-RIGHT"
-        else:
-            return "CENTER"
 
+# =========================================================
+# MAIN
+# =========================================================
 if __name__ == "__main__":
-    q = queue.Queue()
-    t = threading.Thread(target=mqtt_thread, args=(q,), daemon=True)
+    # Start UDP sender thread
+    t = threading.Thread(target=udp_thread, daemon=True)
     t.start()
+
     root = tk.Tk()
-    app = JoystickUI(root, q)
+    app = JoystickUI(root)
     root.mainloop()
