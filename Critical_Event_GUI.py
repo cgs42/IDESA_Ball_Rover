@@ -4,11 +4,15 @@ import threading
 import time
 import socket
 import struct
+try:
+    import pygame
+except Exception:
+    pygame = None
 
 # =========================================================
 # UDP SETUP
 # =========================================================
-UDP_IP = "138.38.226.46"   # Update as needed
+UDP_IP = "138.38.229.217"   # Update as needed
 UDP_PORT = 25000
 
 UDP_RATE_HZ = 2.0  # 2 messages per second
@@ -19,6 +23,14 @@ udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 udp_enabled = False
 left_cmd = 0.0
 right_cmd = 0.0
+
+# =========================================================
+# JOYSTICK CONFIG (Nintendo controller)
+# =========================================================
+JOYSTICK_DEADZONE = 0.08
+AXIS_FORWARD = 1  # typically left stick Y
+AXIS_TURN = 0     # typically left stick X
+INVERT_FORWARD = True  # push up = positive
 
 
 def udp_thread():
@@ -34,6 +46,95 @@ def udp_thread():
             print(f"Sent UDP (binary floats): L={left_cmd:.3f}, R={right_cmd:.3f}")
 
         time.sleep(interval)
+
+
+def _apply_deadzone(value, deadzone):
+    if abs(value) < deadzone:
+        return 0.0
+    return value
+
+
+def joystick_thread():
+    global left_cmd, right_cmd, udp_enabled
+
+    if pygame is None:
+        print("[JOYSTICK] pygame not available. Install pygame to use a real controller.")
+        return
+
+    try:
+        pygame.init()
+        pygame.joystick.init()
+    except Exception as e:
+        print(f"[JOYSTICK] init failed: {e}")
+        return
+
+    js = None
+
+    def _connect_first_joystick():
+        nonlocal js
+        try:
+            if pygame.joystick.get_count() > 0:
+                js = pygame.joystick.Joystick(0)
+                js.init()
+                print(f"[JOYSTICK] connected: {js.get_name()}")
+        except Exception as e:
+            print(f"[JOYSTICK] connect failed: {e}")
+            js = None
+
+    _connect_first_joystick()
+
+    while True:
+        try:
+            pygame.event.pump()
+        except Exception:
+            pass
+
+        if js is None or not js.get_init():
+            _connect_first_joystick()
+
+        if js is None:
+            left_cmd = 0.0
+            right_cmd = 0.0
+            time.sleep(0.1)
+            continue
+
+        try:
+            forward = float(js.get_axis(AXIS_FORWARD))
+            turn = float(js.get_axis(AXIS_TURN))
+        except Exception:
+            forward = 0.0
+            turn = 0.0
+
+        if INVERT_FORWARD:
+            forward = -forward
+
+        forward = _apply_deadzone(forward, JOYSTICK_DEADZONE)
+        turn = _apply_deadzone(turn, JOYSTICK_DEADZONE)
+
+        # Expo shaping
+        EXPO_FORWARD = 1.5
+        EXPO_TURN = 2.0
+
+        forward = math.copysign(abs(forward) ** EXPO_FORWARD, forward)
+        turn = math.copysign(abs(turn) ** EXPO_TURN, turn)
+
+        # Differential drive mix
+        left = forward + turn
+        right = forward - turn
+
+        # Normalize
+        max_mag = max(abs(left), abs(right), 1.0)
+        left /= max_mag
+        right /= max_mag
+
+        if udp_enabled:
+            left_cmd = left
+            right_cmd = right
+        else:
+            left_cmd = 0.0
+            right_cmd = 0.0
+
+        time.sleep(0.01)
 
 
 # =========================================================
@@ -95,8 +196,7 @@ class JoystickUI:
             outline="black"
         )
 
-        self.canvas.bind("<B1-Motion>", self.move)
-        self.canvas.bind("<ButtonRelease-1>", self.release)
+        # GUI joystick disabled; real controller used instead
 
     def toggle(self):
         global udp_enabled, left_cmd, right_cmd
@@ -176,6 +276,10 @@ if __name__ == "__main__":
     # Start UDP sender thread
     t = threading.Thread(target=udp_thread, daemon=True)
     t.start()
+
+    # Start joystick reader thread
+    jt = threading.Thread(target=joystick_thread, daemon=True)
+    jt.start()
 
     root = tk.Tk()
     app = JoystickUI(root)
