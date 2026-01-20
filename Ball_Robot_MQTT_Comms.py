@@ -42,7 +42,7 @@ COLLECTION_RADIUS_PX = 30      # distance from target position to consider miner
 TARGET_PAUSE_SEC = 5.0         # time to wait at each target before moving to the next in seconds
 DETECTION_TIME_SEC = 5.0       # time allowed for mineral detection phase to accomodate for detection flickering in seconds
 BASE_ID = 6                    # aruco code ID representing home base
-Robot_ID = 106                 # aruco code ID representing the robot
+Robot_ID = 145                 # aruco code ID representing the robot
 CRISIS_WEATHER_ID = 10         # aruco code ID representing localised weather event
 
 WEATHER_AVOID_RADIUS_MM = 50   # radius around crisis event to avoid in mm
@@ -221,8 +221,7 @@ def compute_shortest_path(start_pos, mineral_items):
     while items:
         mid, pos = min(
             items,
-            key=lambda x: math.hypot(current[0] - x[1][0], current[1] - x[1][1])
-        )
+            key=lambda x: math.hypot(current[0] - x[1][0], current[1] - x[1][1]))
         path.append(mid)
         current = pos
         items = [i for i in items if i[0] != mid]
@@ -313,14 +312,7 @@ def toggle_mineral_find():
         current_waypoints = []
         unsafe_minerals.clear()
 
-button = tk.Button(
-    left_frame,
-    text="Find Minerals",
-    bg="#222",
-    fg="white",
-    font=("Arial", 14),
-    command=toggle_mineral_find
-)
+button = tk.Button(left_frame,text="Find Minerals",bg="#222",fg="white",font=("Arial", 14),command=toggle_mineral_find)
 button.pack(pady=10)
 
 camera_label = tk.Label(left_frame, bg="black")
@@ -353,11 +345,10 @@ def camera_thread():
         robot_pos = None
         robot_yaw = None
         robot_green_yaw = None
+        robot_green_vec = None
 
         if ids is not None:
-            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
-                corners, marker_size, CM, dist_coef
-            )
+            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, marker_size, CM, dist_coef)
 
             for i, mid in enumerate(ids.flatten()):
                 tvec = tvecs[i][0]  # in mm
@@ -369,8 +360,10 @@ def camera_thread():
                     robot_yaw = math.degrees(math.atan2(R[1, 0], R[0, 0]))
                     try:
                         robot_green_yaw = math.degrees(math.atan2(R[1, 1], R[0, 1]))
+                        robot_green_vec = np.array([R[0, 1], R[1, 1]], dtype=float)
                     except Exception:
                         robot_green_yaw = robot_yaw
+                        robot_green_vec = None
 
                 # Base detection (always active)
                 if mid == BASE_ID:
@@ -413,11 +406,7 @@ def camera_thread():
                 safe_minerals = [mid for mid in remaining_minerals if is_mineral_safe(mid, weather_pos)]
                 if safe_minerals:
                     # Choose nearest safe mineral to current robot position
-                    current_target_id = min(
-                        safe_minerals,
-                        key=lambda mid: math.hypot(robot_pos[0] - mineral_map[mid][0],
-                                                   robot_pos[1] - mineral_map[mid][1])
-                    )
+                    current_target_id = min(safe_minerals,key=lambda mid: math.hypot(robot_pos[0] - mineral_map[mid][0],robot_pos[1] - mineral_map[mid][1]))
                 else:
                     # No safe minerals for now – wait
                     current_target_id = None
@@ -508,10 +497,32 @@ def camera_thread():
                 dx = target_x - rx
                 dy = target_y - ry
 
-                # Compute target angle in camera XY plane and use robot green axis as heading
-                target_angle = math.degrees(math.atan2(dy, dx))
-                base_yaw = robot_green_yaw if robot_green_yaw is not None else (robot_yaw if robot_yaw is not None else 0.0)
-                relative_angle = (target_angle - base_yaw + 180) % 360 - 180
+                # Compute signed relative angle between robot green-axis and path using dot/cross
+                if robot_green_vec is not None:
+                    forward = robot_green_vec.astype(float)
+                    f_norm = np.linalg.norm(forward)
+                    if f_norm > 1e-6:
+                        forward /= f_norm
+                    else:
+                        forward = np.array([0.0, 1.0], dtype=float)
+                else:
+                    if robot_green_yaw is not None:
+                        ang = math.radians(robot_green_yaw)
+                        forward = np.array([math.cos(ang), math.sin(ang)], dtype=float)
+                    else:
+                        forward = np.array([0.0, 1.0], dtype=float)
+
+                path = np.array([dx, dy], dtype=float)
+                p_norm = np.linalg.norm(path)
+                if p_norm > 1e-6:
+                    path_unit = path / p_norm
+                else:
+                    path_unit = np.array([0.0, 0.0], dtype=float)
+
+                dot = float(forward[0]*path_unit[0] + forward[1]*path_unit[1])
+                cross = float(forward[0]*path_unit[1] - forward[1]*path_unit[0])
+                angle_rad = math.atan2(cross, dot)
+                relative_angle = math.degrees(angle_rad)
                 relative_distance = math.hypot(dx, dy)
 
                 udp_sock.sendto(

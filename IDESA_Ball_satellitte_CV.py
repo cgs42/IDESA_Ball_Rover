@@ -31,7 +31,7 @@ camera_calibration = np.load('workdir/Calibration.npz')
 CM = camera_calibration['CM']
 dist_coef = camera_calibration['dist_coef']
 
-marker_sizes = { 145: 100, 1: 67, 2: 67, 3: 67, 4: 67, 5: 67, 6: 67, 9: 67, 10: 67, 11: 67}  # aruco codes sizes in mm
+marker_sizes = { 145: 100, 1: 75, 2: 75, 3: 75, 4: 75, 5: 75, 6: 75, 9: 75, 10: 75, 11: 75}  # aruco codes sizes in mm
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_250)
 parameters = aruco.DetectorParameters()
 
@@ -103,6 +103,8 @@ def find_blob_center(mask, min_area=300):
 orange_blob = None
 red_blob = None
 green_blob = None
+# Orange crisis visibility (True while blob is on screen)
+orange_visible = False
 
 # =========================================================
 # UDP SETUP (AUTONOMOUS + JOYSTICK SHARE SAME SOCKET)
@@ -765,8 +767,11 @@ plot_start_time = None
 plotting_enabled = False
 MAX_PLOT_POINTS = 400
 # Plot redraw throttle (seconds)
-PLOT_UPDATE_INTERVAL = 0.01
+PLOT_UPDATE_INTERVAL = 0.1
 plot_last_draw_time = 0.0
+# Minimap redraw throttle (seconds)
+MINIMAP_UPDATE_INTERVAL = 0.1
+minimap_last_draw_time = 0.0
 
 def _create_plot_canvas(parent):
     global plot_canvas
@@ -826,7 +831,7 @@ def camera_thread():
     global system_active, base_added_to_path
     global weather_pos, prev_weather_pos, detour_waypoint
     global override_state  # to suppress autonomous UDP when manual override is on
-    global orange_blob, red_blob, green_blob
+    global orange_blob, red_blob, green_blob, orange_visible
     global robot_pos, robot_yaw, robot_green_yaw, robot_pixel_size
     global robot_last_seen_time
     global pending_return_to_base
@@ -866,6 +871,7 @@ def camera_thread():
         orange_blob = find_blob_center(mask_orange)
         red_blob = find_blob_center(mask_red) # green
         green_blob = find_blob_center(mask_green)
+        orange_visible = orange_blob is not None
 
         # Convert pixel coords to "fake" mm coords (same as ArUco tvecs)
         # You can refine this later with calibration if needed
@@ -875,6 +881,9 @@ def camera_thread():
             prev_weather_pos = weather_pos
             weather_pos = np.array([orange_blob[0], orange_blob[1], 0.0])
             # print("Orange blob detected at", orange_blob)
+        else:
+            # Clear weather position when orange crisis is no longer visible
+            weather_pos = None
 
         if red_blob is not None:
             # print("Red blob detected at", red_blob)
@@ -1208,10 +1217,26 @@ def camera_thread():
                 detour_waypoint = None
 
         # Autonomous UDP sending (disabled when manual override is active)
+        # Also halt completely while orange crisis is visible on screen.
         can_send_auto = (system_active and robot_pos is not None and robot_yaw is not None and current_target_id is not None and override_state == 0)  # ONLY send autonomous commands in autonomous mode
         if can_send_auto:
             now = time.time()
             if now - last_udp_time >= 1.0 / UDP_RATE_HZ:
+                # Hard stop while orange crisis is visible on screen
+                if orange_visible:
+                    try:
+                        send_udp_packet(0.0, 0.0)
+                    except Exception:
+                        pass
+                    # reset EMA state while stopped so it doesn't smear across resume
+                    try:
+                        ema_udp_distance = None
+                        ema_udp_cos = None
+                        ema_udp_sin = None
+                    except Exception:
+                        pass
+                    last_udp_time = now
+                    continue
                 rx, ry, rz = robot_pos
 
                 # Fail-safe: if robot marker hasn't been seen for >2s, send zeros
@@ -1425,8 +1450,15 @@ def camera_thread():
                 # print(f"[UDP AUTO DEBUG] not sending: {', '.join(reasons) or 'unknown'}")
                 camera_thread._udp_debug_last = time.time()
 
-        if not frame_queue.full():
-            frame_queue.put((vis_frame, robot_pos))
+        if frame_queue.full():
+            try:
+                frame_queue.get_nowait()
+            except Exception:
+                pass
+        try:
+            frame_queue.put_nowait((vis_frame, robot_pos))
+        except Exception:
+            pass
 
 # =========================================================
 # JOYSTICK UDP THREAD (MANUAL MODE)
@@ -1741,264 +1773,275 @@ def apply_filters_frame(frame):
         return frame
 def update_ui():
     global robot_pos
-    if not frame_queue.empty():
-        frame, robot_pos = frame_queue.get()
+    try:
+        if not frame_queue.empty():
+            frame, robot_pos = frame_queue.get()
 
-        # Draw logical path (ID sequence) in BLUE
-        if robot_pos is not None and path_order:
-            pts = [robot_pos] + [mineral_map[mid] for mid in path_order if mid in mineral_map]
-            for i in range(len(pts) - 1):
-                cv2.line(
-                    frame,
-                    (int(pts[i][0]), int(pts[i][1])),
-                    (int(pts[i+1][0]), int(pts[i+1][1])),
-                    (255, 0, 0),
-                    2
-                )   # BLUE
+            # Draw logical path (ID sequence) in BLUE
+            if robot_pos is not None and path_order:
+                pts = [robot_pos] + [mineral_map[mid] for mid in path_order if mid in mineral_map]
+                for i in range(len(pts) - 1):
+                    cv2.line(
+                        frame,
+                        (int(pts[i][0]), int(pts[i][1])),
+                        (int(pts[i+1][0]), int(pts[i+1][1])),
+                        (255, 0, 0),
+                        2
+                    )   # BLUE
 
-        # Draw planned path to current target in GREEN:
-        # robot -> detour waypoint (if any) -> current target
-        if current_target_id == BASE_ID and BASE_ID not in mineral_map:
-            # print("[UI] Warning: Base position unknown, cannot draw path to base.")
-            return
-        
-        if robot_pos is not None and current_target_id:
-            rx, ry, rz = robot_pos
-            tx, ty, tz = mineral_map[current_target_id]
-
-            if CRISIS_EVENTS_ENABLED and detour_waypoint is not None:
-                wx, wy = detour_waypoint
-                # robot -> waypoint
-                cv2.line(
-                    frame,
-                    (int(rx), int(ry)),
-                    (int(wx), int(wy)),
-                    (0, 255, 0),
-                    3
-                )
-                # waypoint -> target
-                cv2.line(
-                    frame,
-                    (int(wx), int(wy)),
-                    (int(tx), int(ty)),
-                    (0, 255, 0),
-                    3
-                )
-            else:
-                # straight line robot -> target
-                cv2.line(
-                    frame,
-                    (int(rx), int(ry)),
-                    (int(tx), int(ty)),
-                    (0, 255, 0),
-                    3
-                )
-
-        # Draw orange crisis radius if visible and enabled
-        if CRISIS_EVENTS_ENABLED and weather_pos is not None:
-            wx, wy, wz = weather_pos
-            cv2.circle(
-                frame,
-                (int(wx), int(wy)),
-                int(WEATHER_AVOID_RADIUS_MM),
-                (0, 165, 255),
-                2
-            )  # orange-ish circle
-            cv2.putText(
-                frame,
-                "Localised weather",
-                (int(wx) + 10, int(wy) - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 165, 255),
-                1
-            )
-            try:
-                status_extra_label.config(text="Localised weather detected")
-            except Exception:
+            # Draw planned path to current target in GREEN:
+            # robot -> detour waypoint (if any) -> current target
+            if current_target_id == BASE_ID and BASE_ID not in mineral_map:
+                # print("[UI] Warning: Base position unknown, cannot draw path to base.")
                 pass
-        # =========================================================
-        # DRAW COLOUR BLOB DETECTIONS
-        # =========================================================
-        if orange_blob is not None:
-            cv2.circle(frame, orange_blob, 10, (0,165,255), -1)
-            cv2.putText(frame, "Orange Crisis", (orange_blob[0]+10, orange_blob[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,165,255), 1)
 
-        if red_blob is not None:
-            cv2.circle(frame, red_blob, 10, (0,0,255), -1)
-            cv2.putText(frame, "Red Crisis", (red_blob[0]+10, red_blob[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+            if robot_pos is not None and current_target_id and (current_target_id in mineral_map):
+                rx, ry, rz = robot_pos
+                tx, ty, tz = mineral_map[current_target_id]
 
-        if green_blob is not None:
-            cv2.circle(frame, green_blob, 10, (0,255,0), -1)
-            cv2.putText(frame, "Green Crisis", (green_blob[0]+10, green_blob[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+                if CRISIS_EVENTS_ENABLED and detour_waypoint is not None:
+                    wx, wy = detour_waypoint
+                    # robot -> waypoint
+                    cv2.line(
+                        frame,
+                        (int(rx), int(ry)),
+                        (int(wx), int(wy)),
+                        (0, 255, 0),
+                        3
+                    )
+                    # waypoint -> target
+                    cv2.line(
+                        frame,
+                        (int(wx), int(wy)),
+                        (int(tx), int(ty)),
+                        (0, 255, 0),
+                        3
+                    )
+                else:
+                    # straight line robot -> target
+                    cv2.line(
+                        frame,
+                        (int(rx), int(ry)),
+                        (int(tx), int(ty)),
+                        (0, 255, 0),
+                        3
+                    )
 
-        # Countdown
-        if waiting_for_next_target:
-            remaining = max(0, int(TARGET_PAUSE_SEC - (time.time() - target_reached_time)))
-            cv2.putText(
-                frame,
-                f"Next target in {remaining}s",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 255),
-                2
-            )
-        # flashing warning triangle for critical event
-        if critical_event_active and critical_event_colour is not None:
-            now = time.time()
-            if now - critical_event_last_toggle >= 0.5:
-                critical_event_visible = not critical_event_visible
-                critical_event_last_toggle = now
+            # Draw orange crisis radius if visible and enabled
+            if CRISIS_EVENTS_ENABLED and weather_pos is not None:
+                wx, wy, wz = weather_pos
+                cv2.circle(
+                    frame,
+                    (int(wx), int(wy)),
+                    int(WEATHER_AVOID_RADIUS_MM),
+                    (0, 165, 255),
+                    2
+                )  # orange-ish circle
+                cv2.putText(
+                    frame,
+                    "Localised weather",
+                    (int(wx) + 10, int(wy) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 165, 255),
+                    1
+                )
+                try:
+                    status_extra_label.config(text="Localised weather detected")
+                except Exception:
+                    pass
+            # =========================================================
+            # DRAW COLOUR BLOB DETECTIONS
+            # =========================================================
+            if orange_blob is not None:
+                cv2.circle(frame, orange_blob, 10, (0,165,255), -1)
+                cv2.putText(frame, "Orange Crisis", (orange_blob[0]+10, orange_blob[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,165,255), 1)
 
-            if critical_event_visible:
-                h, w, _ = frame.shape
-                pts = np.array([[w - 80, 40], [w - 40, 100], [w - 120, 100]], np.int32)
-                cv2.fillConvexPoly(frame, [pts], critical_event_colour)
-                cv2.putText(frame, "!", (w-82, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-                
+            if red_blob is not None:
+                cv2.circle(frame, red_blob, 10, (0,0,255), -1)
+                cv2.putText(frame, "Red Crisis", (red_blob[0]+10, red_blob[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
 
-        # Frames are already filtered in the camera thread; overlays drawn on `vis_frame`.
+            if green_blob is not None:
+                cv2.circle(frame, green_blob, 10, (0,255,0), -1)
+                cv2.putText(frame, "Green Crisis", (green_blob[0]+10, green_blob[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
 
-        # Convert and resize using OpenCV (faster than PIL resize on full image)
-        try:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            resized = cv2.resize(frame_rgb, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_AREA)
-            img = ImageTk.PhotoImage(Image.fromarray(resized))
-            camera_label.imgtk = img
-            camera_label.config(image=img)
-        except Exception:
+            # Countdown
+            if waiting_for_next_target:
+                remaining = max(0, int(TARGET_PAUSE_SEC - (time.time() - target_reached_time)))
+                cv2.putText(
+                    frame,
+                    f"Next target in {remaining}s",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 255, 255),
+                    2
+                )
+            # flashing warning triangle for critical event
+            if critical_event_active and critical_event_colour is not None:
+                now = time.time()
+                if now - critical_event_last_toggle >= 0.5:
+                    critical_event_visible = not critical_event_visible
+                    critical_event_last_toggle = now
+
+                if critical_event_visible:
+                    h, w, _ = frame.shape
+                    pts = np.array([[w - 80, 40], [w - 40, 100], [w - 120, 100]], np.int32)
+                    cv2.fillConvexPoly(frame, [pts], critical_event_colour)
+                    cv2.putText(frame, "!", (w-82, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
+
+
+            # Frames are already filtered in the camera thread; overlays drawn on `vis_frame`.
+
+            # Convert and resize using OpenCV (faster than PIL resize on full image)
             try:
-                # fallback to original method if any error
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = ImageTk.PhotoImage(Image.fromarray(frame).resize((DISPLAY_W, DISPLAY_H)))
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                resized = cv2.resize(frame_rgb, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_AREA)
+                img = ImageTk.PhotoImage(Image.fromarray(resized))
                 camera_label.imgtk = img
                 camera_label.config(image=img)
             except Exception:
-                pass
-        
-    # Update status bar
-    mode_str = ("Manual" if override_state == 1 else ("Autonomous" if system_active else "Idle"))
-    # If we're actively investigating a live green target, show that in the status
-    try:
-        if green_investigate and green_target_pos is not None and (time.time() - green_last_seen) < GREEN_INVESTIGATE_TIMEOUT:
-            target_str = "Green"
-        else:
-            target_str = (str(current_target_id) if current_target_id is not None else "---")
-    except Exception:
-        target_str = (str(current_target_id) if current_target_id is not None else "---")
-    if robot_pos is not None:
-        rx, ry, rz = robot_pos
-        robot_str = f"({int(rx)}, {int(ry)})"
-    else:
-        robot_str = "(---, ---)"
-
-    try:
-        status_mode_label.config(text=f"Mode: {mode_str}")
-        status_target_label.config(text=f"Target: {target_str}")
-        status_robot_label.config(text=f"Robot: {robot_str}")
-    except Exception:
-        pass
-
-    # ========================================================
-    # minimap drawing
-    # ========================================================
-    minimap.delete("all")
-    minimap.create_rectangle(0,0,minimap_sizex,minimap_sizey, outline="#2B4A6A")
-
-    def map_to_minimap(x,y, scale=0.2):
-        cx = minimap_sizex / 2 + x * scale
-        cy = (minimap_sizey / 2 + y * scale)
-        return cx, cy
-    
-    # Draw minerals
-    for mid, pos in mineral_map.items():
-        if mid in MINERAL_IDS:
-            mx, my, mz = pos
-            px, py = map_to_minimap(mx, my)
-            minimap.create_oval(px-3, py-3, px+3, py+3, fill="#4FD1C5", outline="")  # teal for minerals
-
-    # Draw base if known
-    if BASE_ID in mineral_map:
-        bx, by, bz = mineral_map[BASE_ID]
-        px, py = map_to_minimap(bx, by)
-        minimap.create_rectangle(px-3, py-3, px+3, py+3, outline="#F6E05E", width=2)  # yellow for base
-
-    # Draw crisis events
-    if weather_pos is not None:
-        wx, wy, wz = weather_pos
-        px, py = map_to_minimap(wx, wy)
-        minimap.create_oval(px-6, py-6, px+6, py+6, outline="#F6AD55", width=2)  # orange for crisis
-
-    # Draw red crisis blob (severe)
-    if red_blob is not None:
-        rbx, rby = red_blob
-        px, py = map_to_minimap(rbx, rby)
-        minimap.create_oval(px-6, py-6, px+6, py+6, outline="#F56565", width=2)  # red for severe
-
-    # Draw green crisis blob (moving object)
-    if green_blob is not None:
-        gbx, gby = green_blob
-        px, py = map_to_minimap(gbx, gby)
-        minimap.create_oval(px-6, py-6, px+6, py+6, outline="#34D399", width=2)  # green for object
-
-    # Draw robot
-    if robot_pos is not None:
-        rx, ry, rz = robot_pos
-        px, py = map_to_minimap(rx, ry)
-        minimap.create_polygon(px, py - 6,px - 5, py + 6,    px + 5, py + 6,  fill="#BA0F7E")  # blue triangle for robot
-
-    root.after(50, update_ui)
-    # Update live plot if enabled (throttled)
-    try:
-        global plotting_enabled, plot_times, plot_angles, plot_distances, plot_canvas, plot_last_draw_time
-        now = time.time()
-        if plot_canvas is not None:
-            # Only redraw at most every PLOT_UPDATE_INTERVAL seconds
-            if plotting_enabled and plot_times and (now - plot_last_draw_time) >= PLOT_UPDATE_INTERVAL:
-                plot_last_draw_time = now
-                plot_ax.clear()
-                dist_ax.clear()
-
-                plot_fig.patch.set_facecolor('#0B1020')
-                plot_ax.set_facecolor('#0B1020')
-
-                last_t = plot_times[-1] if plot_times else 0.0
-                window_start = math.floor(last_t / 10.0) * 10.0
-                window_end = window_start + 10.0
-
-                plot_ax.plot(plot_times, plot_angles, color='tab:blue')
-                dist_ax.plot(plot_times, plot_distances, color='#F6E05E')
-
-                plot_ax.set_ylim(-180, 180)
-                dist_ax.set_ylim(0, 2000)
-                plot_ax.set_ylabel('Angle (deg)', color='tab:blue')
-                dist_ax.set_ylabel('Distance (mm)', color='#F6E05E')
-                plot_ax.set_xlabel('Time (s)')
-
-                plot_ax.tick_params(axis='y', colors='tab:blue')
-                dist_ax.tick_params(axis='y', colors='#F6E05E')
                 try:
-                    plot_ax.spines['left'].set_color('tab:blue')
-                    dist_ax.spines['right'].set_color('#F6E05E')
+                    # fallback to original method if any error
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = ImageTk.PhotoImage(Image.fromarray(frame).resize((DISPLAY_W, DISPLAY_H)))
+                    camera_label.imgtk = img
+                    camera_label.config(image=img)
                 except Exception:
                     pass
 
-                plot_ax.set_xlim(window_start, window_end)
-                plot_ax.grid(False)
-                plot_canvas.draw_idle()
-            elif not plotting_enabled and plot_canvas is not None and (now - plot_last_draw_time) >= PLOT_UPDATE_INTERVAL:
-                # clear when not plotting (throttled)
-                plot_last_draw_time = now
-                plot_ax.clear()
-                dist_ax.clear()
-                plot_canvas.draw_idle()
+        # Update status bar
+        mode_str = ("Manual" if override_state == 1 else ("Autonomous" if system_active else "Idle"))
+        # If we're actively investigating a live green target, show that in the status
+        try:
+            if green_investigate and green_target_pos is not None and (time.time() - green_last_seen) < GREEN_INVESTIGATE_TIMEOUT:
+                target_str = "Green"
+            else:
+                target_str = (str(current_target_id) if current_target_id is not None else "---")
+        except Exception:
+            target_str = (str(current_target_id) if current_target_id is not None else "---")
+        if robot_pos is not None:
+            rx, ry, rz = robot_pos
+            robot_str = f"({int(rx)}, {int(ry)})"
+        else:
+            robot_str = "(---, ---)"
+
+        try:
+            status_mode_label.config(text=f"Mode: {mode_str}")
+            status_target_label.config(text=f"Target: {target_str}")
+            status_robot_label.config(text=f"Robot: {robot_str}")
+        except Exception:
+            pass
+
+        # ========================================================
+        # minimap drawing
+        # ========================================================
+        try:
+            global minimap_last_draw_time
+            now_m = time.time()
+            if (now_m - minimap_last_draw_time) >= MINIMAP_UPDATE_INTERVAL:
+                minimap_last_draw_time = now_m
+                minimap.delete("all")
+                minimap.create_rectangle(0,0,minimap_sizex,minimap_sizey, outline="#2B4A6A")
+
+                def map_to_minimap(x,y, scale=0.2):
+                    cx = minimap_sizex / 2 + x * scale
+                    cy = (minimap_sizey / 2 + y * scale)
+                    return cx, cy
+
+                # Draw minerals
+                for mid, pos in mineral_map.items():
+                    if mid in MINERAL_IDS:
+                        mx, my, mz = pos
+                        px, py = map_to_minimap(mx, my)
+                        minimap.create_oval(px-3, py-3, px+3, py+3, fill="#4FD1C5", outline="")  # teal for minerals
+
+                # Draw base if known
+                if BASE_ID in mineral_map:
+                    bx, by, bz = mineral_map[BASE_ID]
+                    px, py = map_to_minimap(bx, by)
+                    minimap.create_rectangle(px-3, py-3, px+3, py+3, outline="#F6E05E", width=2)  # yellow for base
+
+                # Draw crisis events
+                if weather_pos is not None:
+                    wx, wy, wz = weather_pos
+                    px, py = map_to_minimap(wx, wy)
+                    minimap.create_oval(px-6, py-6, px+6, py+6, outline="#F6AD55", width=2)  # orange for crisis
+
+                # Draw red crisis blob (severe)
+                if red_blob is not None:
+                    rbx, rby = red_blob
+                    px, py = map_to_minimap(rbx, rby)
+                    minimap.create_oval(px-6, py-6, px+6, py+6, outline="#F56565", width=2)  # red for severe
+
+                # Draw green crisis blob (moving object)
+                if green_blob is not None:
+                    gbx, gby = green_blob
+                    px, py = map_to_minimap(gbx, gby)
+                    minimap.create_oval(px-6, py-6, px+6, py+6, outline="#34D399", width=2)  # green for object
+
+                # Draw robot
+                if robot_pos is not None:
+                    rx, ry, rz = robot_pos
+                    px, py = map_to_minimap(rx, ry)
+                    minimap.create_polygon(px, py - 6,px - 5, py + 6,    px + 5, py + 6,  fill="#BA0F7E")  # blue triangle for robot
+        except Exception:
+            pass
+
+        # Update live plot if enabled (throttled)
+        try:
+            global plotting_enabled, plot_times, plot_angles, plot_distances, plot_canvas, plot_last_draw_time
+            now = time.time()
+            if plot_canvas is not None:
+                # Only redraw at most every PLOT_UPDATE_INTERVAL seconds
+                if plotting_enabled and plot_times and (now - plot_last_draw_time) >= PLOT_UPDATE_INTERVAL:
+                    plot_last_draw_time = now
+                    plot_ax.clear()
+                    dist_ax.clear()
+
+                    plot_fig.patch.set_facecolor('#0B1020')
+                    plot_ax.set_facecolor('#0B1020')
+
+                    last_t = plot_times[-1] if plot_times else 0.0
+                    window_start = math.floor(last_t / 10.0) * 10.0
+                    window_end = window_start + 10.0
+
+                    plot_ax.plot(plot_times, plot_angles, color='tab:blue')
+                    dist_ax.plot(plot_times, plot_distances, color='#F6E05E')
+
+                    plot_ax.set_ylim(-180, 180)
+                    dist_ax.set_ylim(0, 2000)
+                    plot_ax.set_ylabel('Angle (deg)', color='tab:blue')
+                    dist_ax.set_ylabel('Distance (mm)', color='#F6E05E')
+                    plot_ax.set_xlabel('Time (s)')
+
+                    plot_ax.tick_params(axis='y', colors='tab:blue')
+                    dist_ax.tick_params(axis='y', colors='#F6E05E')
+                    try:
+                        plot_ax.spines['left'].set_color('tab:blue')
+                        dist_ax.spines['right'].set_color('#F6E05E')
+                    except Exception:
+                        pass
+
+                    plot_ax.set_xlim(window_start, window_end)
+                    plot_ax.grid(False)
+                    plot_canvas.draw_idle()
+                elif not plotting_enabled and plot_canvas is not None and (now - plot_last_draw_time) >= PLOT_UPDATE_INTERVAL:
+                    # clear when not plotting (throttled)
+                    plot_last_draw_time = now
+                    plot_ax.clear()
+                    dist_ax.clear()
+                    plot_canvas.draw_idle()
+        except Exception:
+            pass
     except Exception:
         pass
+    finally:
+        root.after(50, update_ui)
 # =========================================================
 # CLEANUP
 # =========================================================
